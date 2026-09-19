@@ -5,19 +5,36 @@ import sqlite3
 import os
 from dotenv import load_dotenv
 
+# Load environment variables
 load_dotenv()
 
 app = Flask(__name__)
 
-# Security settings
-app.secret_key = os.getenv("FLASK_SECRET_KEY")
+# =========================
+# ENVIRONMENT VARIABLES
+# =========================
 
+FLASK_SECRET_KEY = os.getenv("FLASK_SECRET_KEY")
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD")
 
-ADMIN_PASSWORD_HASH = generate_password_hash(
-    os.getenv("ADMIN_PASSWORD")
-)
+# Check required environment variables
+if not FLASK_SECRET_KEY:
+    raise RuntimeError("FLASK_SECRET_KEY is missing")
 
+if not ADMIN_USERNAME:
+    raise RuntimeError("ADMIN_USERNAME is missing")
+
+if not ADMIN_PASSWORD:
+    raise RuntimeError("ADMIN_PASSWORD is missing")
+
+# Flask session security
+app.secret_key = FLASK_SECRET_KEY
+
+# Create secure password hash
+ADMIN_PASSWORD_HASH = generate_password_hash(ADMIN_PASSWORD)
+
+# Allow frontend requests
 CORS(app)
 
 
@@ -26,22 +43,15 @@ CORS(app)
 # =========================
 
 def get_database():
-    database_path = os.path.join(
-        os.path.dirname(__file__),
-        "bookings.db"
-    )
-
-    connection = sqlite3.connect(database_path)
-    connection.row_factory = sqlite3.Row
-
-    return connection
+    database = sqlite3.connect("bookings.db")
+    database.row_factory = sqlite3.Row
+    return database
 
 
 def create_table():
+    database = get_database()
 
-    connection = get_database()
-
-    connection.execute("""
+    database.execute("""
         CREATE TABLE IF NOT EXISTS bookings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
@@ -55,39 +65,33 @@ def create_table():
         )
     """)
 
-    connection.commit()
-
-    # Make sure status exists in older databases
-    columns = connection.execute(
+    # Make sure older databases also have the status column
+    columns = database.execute(
         "PRAGMA table_info(bookings)"
     ).fetchall()
 
     column_names = [column["name"] for column in columns]
 
     if "status" not in column_names:
+        database.execute(
+            "ALTER TABLE bookings ADD COLUMN status TEXT DEFAULT 'Pending'"
+        )
 
-        connection.execute("""
-            ALTER TABLE bookings
-            ADD COLUMN status TEXT DEFAULT 'Pending'
-        """)
-
-        connection.commit()
-
-    connection.close()
+    database.commit()
+    database.close()
 
 
 # =========================
-# CUSTOMER WEBSITE
+# HOME PAGE
 # =========================
 
 @app.route("/")
 def home():
-
     return render_template("index.html")
 
 
 # =========================
-# BOOKING
+# CUSTOMER BOOKING
 # =========================
 
 @app.route("/booking", methods=["POST"])
@@ -101,80 +105,83 @@ def booking():
             "message": "No booking information received."
         }), 400
 
-    name = data.get("name", "").strip()
-    phone = data.get("phone", "").strip()
-    email = data.get("email", "").strip()
-    vehicle = data.get("vehicle", "").strip()
-    service = data.get("service", "").strip()
-    date = data.get("date", "").strip()
-    message = data.get("message", "").strip()
+    required_fields = [
+        "name",
+        "phone",
+        "email",
+        "vehicle",
+        "service",
+        "date"
+    ]
 
-    if not name or not phone or not email or not vehicle or not service or not date:
+    for field in required_fields:
+        if not data.get(field):
+            return jsonify({
+                "success": False,
+                "message": f"Please provide {field}."
+            }), 400
 
-        return jsonify({
-            "success": False,
-            "message": "Please complete all required fields."
-        }), 400
+    database = get_database()
 
-    connection = get_database()
-
-    connection.execute("""
+    database.execute("""
         INSERT INTO bookings
         (name, phone, email, vehicle, service, date, message, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'Pending')
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     """, (
-        name,
-        phone,
-        email,
-        vehicle,
-        service,
-        date,
-        message
+        data["name"],
+        data["phone"],
+        data["email"],
+        data["vehicle"],
+        data["service"],
+        data["date"],
+        data.get("message", ""),
+        "Pending"
     ))
 
-    connection.commit()
-    connection.close()
+    database.commit()
+    database.close()
 
     return jsonify({
         "success": True,
-        "message": "Booking submitted successfully!"
+        "message": "Your booking request has been submitted successfully."
     })
 
 
 # =========================
-# LOGIN
+# ADMIN LOGIN
 # =========================
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
 
-    if request.method == "GET":
+    # If already logged in, go to dashboard
+    if session.get("admin_logged_in"):
+        return redirect("/dashboard")
 
-        if session.get("admin_logged_in"):
+    error = None
+
+    if request.method == "POST":
+
+        username = request.form.get("username", "")
+        password = request.form.get("password", "")
+
+        if (
+            username == ADMIN_USERNAME
+            and check_password_hash(ADMIN_PASSWORD_HASH, password)
+        ):
+            session["admin_logged_in"] = True
             return redirect("/dashboard")
 
-        return render_template("login.html")
-
-    username = request.form.get("username", "")
-    password = request.form.get("password", "")
-
-    if (
-        username == ADMIN_USERNAME
-        and check_password_hash(ADMIN_PASSWORD_HASH, password)
-    ):
-
-        session["admin_logged_in"] = True
-
-        return redirect("/dashboard")
+        error = "Invalid username or password."
 
     return render_template(
         "login.html",
-        error="Invalid username or password."
+        error=error
     )
 
 
 # =========================
-# LOGOUT
+# ADMIN LOGOUT
 # =========================
 
 @app.route("/logout")
@@ -193,22 +200,22 @@ def logout():
 def dashboard():
 
     if not session.get("admin_logged_in"):
-
         return redirect("/login")
 
     search = request.args.get("search", "").strip()
 
-    connection = get_database()
+    database = get_database()
 
     if search:
 
-        bookings = connection.execute("""
+        bookings = database.execute("""
             SELECT *
             FROM bookings
-            WHERE name LIKE ?
-               OR phone LIKE ?
-               OR vehicle LIKE ?
-               OR service LIKE ?
+            WHERE
+                name LIKE ?
+                OR phone LIKE ?
+                OR vehicle LIKE ?
+                OR service LIKE ?
             ORDER BY id DESC
         """, (
             f"%{search}%",
@@ -219,38 +226,39 @@ def dashboard():
 
     else:
 
-        bookings = connection.execute("""
+        bookings = database.execute("""
             SELECT *
             FROM bookings
             ORDER BY id DESC
         """).fetchall()
 
-    total = connection.execute(
+    # Dashboard statistics
+    total = database.execute(
         "SELECT COUNT(*) FROM bookings"
     ).fetchone()[0]
 
-    pending = connection.execute(
+    pending = database.execute(
         "SELECT COUNT(*) FROM bookings WHERE status = 'Pending'"
     ).fetchone()[0]
 
-    confirmed = connection.execute(
+    confirmed = database.execute(
         "SELECT COUNT(*) FROM bookings WHERE status = 'Confirmed'"
     ).fetchone()[0]
 
-    completed = connection.execute(
+    completed = database.execute(
         "SELECT COUNT(*) FROM bookings WHERE status = 'Completed'"
     ).fetchone()[0]
 
-    connection.close()
+    database.close()
 
     return render_template(
         "dashboard.html",
         bookings=bookings,
+        search=search,
         total=total,
         pending=pending,
         confirmed=confirmed,
-        completed=completed,
-        search=search
+        completed=completed
     )
 
 
@@ -258,14 +266,10 @@ def dashboard():
 # UPDATE BOOKING STATUS
 # =========================
 
-@app.route(
-    "/update-status/<int:booking_id>",
-    methods=["POST"]
-)
+@app.route("/update-status/<int:booking_id>", methods=["POST"])
 def update_status(booking_id):
 
     if not session.get("admin_logged_in"):
-
         return redirect("/login")
 
     status = request.form.get("status")
@@ -278,12 +282,11 @@ def update_status(booking_id):
     ]
 
     if status not in allowed_statuses:
+        return "Invalid status", 400
 
-        return redirect("/dashboard")
+    database = get_database()
 
-    connection = get_database()
-
-    connection.execute("""
+    database.execute("""
         UPDATE bookings
         SET status = ?
         WHERE id = ?
@@ -292,8 +295,8 @@ def update_status(booking_id):
         booking_id
     ))
 
-    connection.commit()
-    connection.close()
+    database.commit()
+    database.close()
 
     return redirect("/dashboard")
 
@@ -302,25 +305,23 @@ def update_status(booking_id):
 # DELETE BOOKING
 # =========================
 
-@app.route(
-    "/delete-booking/<int:booking_id>",
-    methods=["POST"]
-)
+@app.route("/delete-booking/<int:booking_id>", methods=["POST"])
 def delete_booking(booking_id):
 
     if not session.get("admin_logged_in"):
-
         return redirect("/login")
 
-    connection = get_database()
+    database = get_database()
 
-    connection.execute("""
+    database.execute("""
         DELETE FROM bookings
         WHERE id = ?
-    """, (booking_id,))
+    """, (
+        booking_id,
+    ))
 
-    connection.commit()
-    connection.close()
+    database.commit()
+    database.close()
 
     return redirect("/dashboard")
 
